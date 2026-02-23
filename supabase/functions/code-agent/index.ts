@@ -27,10 +27,7 @@ async function getFileContent(owner: string, name: string, path: string, token: 
   const res = await fetch(`https://api.github.com/repos/${owner}/${name}/contents/${encodeURIComponent(path)}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" },
   });
-  if (!res.ok) {
-    console.error(`Failed to get file ${path}: ${res.status}`);
-    return null;
-  }
+  if (!res.ok) return null;
   const data = await res.json();
   if (data.encoding === "base64") {
     try {
@@ -72,6 +69,22 @@ async function commitFile(
   return res.json();
 }
 
+// Detect if this is a web project (React, Vite, etc.)
+function detectProjectType(files: string[]): string {
+  const hasPackageJson = files.includes("package.json");
+  const hasViteConfig = files.some(f => f.includes("vite.config"));
+  const hasTsConfig = files.includes("tsconfig.json");
+  const hasSrcFolder = files.some(f => f.startsWith("src/"));
+  const hasIndexHtml = files.includes("index.html");
+  const hasNextConfig = files.some(f => f.includes("next.config"));
+  
+  if (hasNextConfig) return "nextjs";
+  if (hasViteConfig && hasSrcFolder) return "vite-react";
+  if (hasPackageJson && hasSrcFolder) return "react";
+  if (hasIndexHtml) return "static-html";
+  return "generic";
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -81,7 +94,7 @@ serve(async (req) => {
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
-    // Step 1: Determine if this is a code change request or just conversation
+    // Step 1: Determine intent
     const intentRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -95,8 +108,8 @@ serve(async (req) => {
             role: "system",
             content: `Analyze the user message and determine if they want to modify code in a GitHub repository, or if they just want to chat/ask a question.
 Return ONLY "code" if they want code changes, or "chat" if they just want to talk.
-Examples of "code": "muda a cor para azul", "adiciona um footer", "refatora o componente", "cria um novo arquivo"
-Examples of "chat": "o que você acha de React?", "me explica como funciona CSS", "oi tudo bem?", "quero criar um novo repositório"`,
+Examples of "code": "muda a cor para azul", "adiciona um footer", "refatora o componente", "cria um novo arquivo", "remove esse texto", "troca o nome"
+Examples of "chat": "o que você acha de React?", "me explica como funciona CSS", "oi tudo bem?", "quero criar um novo repositório", "como eu faço deploy?"`,
           },
           { role: "user", content: message },
         ],
@@ -109,7 +122,7 @@ Examples of "chat": "o que você acha de React?", "me explica como funciona CSS"
     const intentData = await intentRes.json();
     const intent = (intentData.choices?.[0]?.message?.content || "").trim().toLowerCase();
 
-    // CHAT MODE: Just respond naturally
+    // CHAT MODE
     if (intent !== "code") {
       const chatRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
         method: "POST",
@@ -135,7 +148,7 @@ Você pode:
 
 Quando o usuário quiser que você modifique o código, ele vai pedir diretamente. Aí sim você age.
 
-Seja natural, como um amigo programador. Não seja robótico. Use emojis quando fizer sentido.`,
+Seja natural, como um amigo programador. Não seja robótico. Use emojis quando fizer sentido. NUNCA inclua blocos de código na resposta.`,
             },
             ...(history || []),
             { role: "user", content: message },
@@ -161,7 +174,7 @@ Seja natural, como um amigo programador. Não seja robótico. Use emojis quando 
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // CODE MODE: Analyze repo, find files, make changes, commit
+    // CODE MODE
     console.log(`[CODE MODE] User wants code changes: "${message}"`);
 
     const branch = await getDefaultBranch(repo_owner, repo_name, github_token);
@@ -171,6 +184,12 @@ Seja natural, como um amigo programador. Não seja robótico. Use emojis quando 
       ?.map((f: any) => f.path) || [];
 
     console.log(`[CODE MODE] Found ${allFiles.length} files in ${branch}`);
+
+    const projectType = detectProjectType(allFiles);
+    console.log(`[CODE MODE] Detected project type: ${projectType}`);
+
+    // Build list of critical files that should NEVER be deleted
+    const criticalFiles = ["package.json", "index.html", "tsconfig.json", "vite.config.ts", "vite.config.js", "tailwind.config.ts", "tailwind.config.js"];
 
     // Step 2: Ask AI which files to load
     const selectionRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
@@ -183,7 +202,7 @@ Seja natural, como um amigo programador. Não seja robótico. Use emojis quando 
         model: "google/gemini-2.5-flash",
         messages: [{
           role: "user",
-          content: `Repository files:\n${allFiles.join("\n")}\n\nUser request: "${message}"\n\nReturn a JSON array of file paths that are relevant to this request. Max 15 files. Only return the JSON array, nothing else.\nExample: ["src/App.css", "src/index.html"]`,
+          content: `Repository files:\n${allFiles.join("\n")}\n\nUser request: "${message}"\n\nReturn a JSON array of file paths that are relevant to this request. Max 15 files. Include files that import/reference the target files too so you understand the context. Only return the JSON array, nothing else.\nExample: ["src/App.css", "src/index.html"]`,
         }],
         temperature: 0.1,
       }),
@@ -202,17 +221,19 @@ Seja natural, como um amigo programador. Não seja robótico. Use emojis quando 
       selectedFiles = allFiles.filter((f: string) => codeExts.some((ext) => f.endsWith(ext))).slice(0, 12);
     }
 
+    // Filter to only existing files
+    selectedFiles = selectedFiles.filter((f: string) => allFiles.includes(f));
     console.log(`[CODE MODE] Selected files: ${selectedFiles.join(", ")}`);
 
     // Step 3: Load file contents
     const fileContents: { path: string; content: string; sha: string }[] = [];
-    for (const fp of selectedFiles) {
-      if (!allFiles.includes(fp)) continue;
+    const loadPromises = selectedFiles.map(async (fp) => {
       const file = await getFileContent(repo_owner, repo_name, fp, github_token);
       if (file && file.content.length < 20000) {
         fileContents.push(file);
       }
-    }
+    });
+    await Promise.all(loadPromises);
 
     console.log(`[CODE MODE] Loaded ${fileContents.length} files`);
 
@@ -233,8 +254,9 @@ Seja natural, como um amigo programador. Não seja robótico. Use emojis quando 
             content: `Você é o JTC COD, agente de edição de código. Você modifica código em repositórios GitHub.
 
 REPOSITÓRIO: ${repo_owner}/${repo_name} (branch: ${branch})
+TIPO DE PROJETO: ${projectType}
 
-TODOS OS ARQUIVOS:
+TODOS OS ARQUIVOS DO REPO:
 ${allFiles.join("\n")}
 
 CONTEÚDO DOS ARQUIVOS CARREGADOS:
@@ -242,7 +264,7 @@ ${fileContext}
 
 Retorne APENAS um JSON válido com esta estrutura:
 {
-  "explanation": "frase curta e natural explicando o que você fez, SEM código",
+  "explanation": "frase curta e natural em português explicando o que você fez, SEM incluir código",
   "changes": [
     {
       "path": "caminho/arquivo.ext",
@@ -253,12 +275,17 @@ Retorne APENAS um JSON válido com esta estrutura:
   "commit_message": "mensagem curta em inglês tipo: fix: change primary color"
 }
 
-REGRAS:
-1. O campo "content" DEVE conter o arquivo INTEIRO, não só a parte modificada
-2. Faça SOMENTE o que o usuário pediu, nada a mais
-3. A "explanation" deve ser natural e curta, sem código
+REGRAS CRÍTICAS:
+1. O campo "content" DEVE conter o arquivo COMPLETO INTEIRO, não só a parte modificada
+2. Faça SOMENTE o que o usuário pediu, nada a mais nada a menos
+3. A "explanation" deve ser natural e curta, sem blocos de código, sem markdown de código
 4. Se precisar criar arquivo novo, use action "create"
-5. NUNCA retorne nada além do JSON`,
+5. NUNCA retorne nada além do JSON
+6. NUNCA delete ou modifique estes arquivos críticos: ${criticalFiles.join(", ")}
+7. Mantenha TODAS as importações e exports existentes intactos
+8. Se um arquivo importa de outro, certifique-se que os imports continuam válidos
+9. Preserve a estrutura do projeto - não quebre o build
+10. Se não souber exatamente o que mudar, pergunte em vez de chutar`,
           },
           ...(history || []),
           { role: "user", content: message },
@@ -282,17 +309,17 @@ REGRAS:
     let parsed;
     try {
       parsed = JSON.parse(rawContent);
-    } catch (parseErr) {
+    } catch {
       console.error(`[CODE MODE] Failed to parse AI response: ${rawContent.substring(0, 500)}`);
       return new Response(JSON.stringify({
-        response: "Desculpa, tive um problema interno ao processar a mudança. Tenta de novo com mais detalhes? 😅",
+        response: "Desculpa, tive um problema ao processar. Tenta de novo com mais detalhes? 😅",
         files_changed: [],
         commit_sha: null,
         commit_message: null,
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // Step 5: Apply changes to GitHub
+    // Step 5: Validate changes before committing
     if (!parsed.changes || parsed.changes.length === 0) {
       return new Response(JSON.stringify({
         response: parsed.explanation || "Não identifiquei nenhuma mudança necessária. Pode detalhar melhor o que quer?",
@@ -302,6 +329,19 @@ REGRAS:
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
+    // Safety check: don't allow deleting/emptying critical files
+    for (const change of parsed.changes) {
+      if (criticalFiles.includes(change.path) && (!change.content || change.content.trim().length < 10)) {
+        return new Response(JSON.stringify({
+          response: `⚠️ Não posso modificar ${change.path} dessa forma - é um arquivo crítico do projeto. Me diz exatamente o que quer mudar nele?`,
+          files_changed: [],
+          commit_sha: null,
+          commit_message: null,
+        }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+    }
+
+    // Step 6: Apply changes to GitHub
     let lastCommitSha: string | null = null;
     const filesChanged: string[] = [];
     const errors: string[] = [];
@@ -334,19 +374,19 @@ REGRAS:
       }
     }
 
-    // Build honest response
+    // Build response
     let response = "";
     if (filesChanged.length > 0) {
-      response = parsed.explanation || "Modificações aplicadas!";
-      response += `\n\n✅ Commitei com sucesso: ${filesChanged.join(", ")}`;
+      response = parsed.explanation || "Pronto, modificações aplicadas!";
+      response += `\n\n✅ Arquivos atualizados: ${filesChanged.join(", ")}`;
       if (lastCommitSha) response += `\n🔗 Commit: \`${lastCommitSha.slice(0, 7)}\``;
     }
 
     if (errors.length > 0) {
       if (filesChanged.length === 0) {
-        response = `❌ Não consegui fazer as modificações. Erros:\n${errors.map(e => `- ${e}`).join("\n")}\n\nPode ser um problema de permissão do token. Verifica se o token tem a permissão "repo" habilitada.`;
+        response = `❌ Não consegui fazer as modificações.\n\n${errors.map(e => `• ${e}`).join("\n")}\n\nVerifica se o token tem a permissão "repo" habilitada.`;
       } else {
-        response += `\n\n⚠️ Alguns arquivos falharam:\n${errors.map(e => `- ${e}`).join("\n")}`;
+        response += `\n\n⚠️ Alguns arquivos falharam:\n${errors.map(e => `• ${e}`).join("\n")}`;
       }
     }
 
