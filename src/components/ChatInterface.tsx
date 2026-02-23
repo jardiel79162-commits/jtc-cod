@@ -2,7 +2,10 @@ import { useState, useEffect, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Send, GitBranch, GitCommit, Unplug, Loader2, Bot, User, FileCode } from "lucide-react";
+import {
+  Send, GitBranch, GitCommit, Unplug, Loader2, Bot, User,
+  FileCode, Undo2, History, X, Clock,
+} from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import ReactMarkdown from "react-markdown";
 
@@ -28,8 +31,10 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isUndoing, setIsUndoing] = useState(false);
   const [status, setStatus] = useState("");
   const [commits, setCommits] = useState<any[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
 
@@ -57,8 +62,57 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
       .select("*")
       .eq("repository_id", repo.id)
       .order("created_at", { ascending: false })
-      .limit(10);
+      .limit(50);
     if (data) setCommits(data);
+  };
+
+  const undoLastCommit = async () => {
+    const undoable = commits.find((c) => c.can_undo);
+    if (!undoable) {
+      toast({ title: "Nada para desfazer", description: "Nenhum commit disponível para reverter.", variant: "destructive" });
+      return;
+    }
+
+    setIsUndoing(true);
+    try {
+      const resp = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/undo-commit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({
+          commit_sha: undoable.commit_sha,
+          repo_owner: repo.repo_owner,
+          repo_name: repo.repo_name,
+          github_token: repo.github_token,
+        }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.error || "Erro ao desfazer");
+      }
+
+      const data = await resp.json();
+
+      // Mark commit as undone
+      await supabase
+        .from("agent_commits")
+        .update({ can_undo: false })
+        .eq("id", undoable.id);
+
+      toast({
+        title: "Desfeito!",
+        description: `${data.files_reverted?.length || 0} arquivo(s) revertido(s).`,
+      });
+
+      loadCommits();
+    } catch (err: any) {
+      toast({ title: "Erro", description: err.message, variant: "destructive" });
+    } finally {
+      setIsUndoing(false);
+    }
   };
 
   const sendMessage = async () => {
@@ -70,7 +124,6 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
     setIsLoading(true);
     setStatus("Analisando código...");
 
-    // Save user message
     const { data: { user } } = await supabase.auth.getUser();
     await supabase.from("chat_messages").insert({
       user_id: user!.id,
@@ -112,7 +165,6 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
 
       setMessages((prev) => [...prev, assistantMessage]);
 
-      // Save assistant message
       await supabase.from("chat_messages").insert({
         user_id: user!.id,
         repository_id: repo.id,
@@ -140,6 +192,8 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
       setIsLoading(false);
     }
   };
+
+  const lastUndoable = commits.find((c) => c.can_undo);
 
   return (
     <div className="flex-1 flex overflow-hidden">
@@ -238,6 +292,7 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
 
       {/* Sidebar */}
       <div className="w-72 border-l border-border bg-card hidden lg:flex flex-col">
+        {/* Repo info */}
         <div className="p-4 border-b border-border">
           <div className="flex items-center gap-2 mb-3">
             <GitBranch className="h-4 w-4 text-primary" />
@@ -250,34 +305,152 @@ const ChatInterface = ({ repo, onDisconnect }: ChatInterfaceProps) => {
             <span className="w-2 h-2 rounded-full bg-primary animate-pulse-glow" />
             <span className="text-xs font-mono text-muted-foreground">Agente ativo</span>
           </div>
+
+          {/* Action buttons */}
+          <div className="flex gap-2 mt-3">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={undoLastCommit}
+              disabled={isUndoing || !lastUndoable}
+              className="flex-1 text-xs font-mono border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              {isUndoing ? (
+                <Loader2 className="h-3 w-3 animate-spin mr-1" />
+              ) : (
+                <Undo2 className="h-3 w-3 mr-1" />
+              )}
+              Desfazer
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowHistory(!showHistory)}
+              className="flex-1 text-xs font-mono"
+            >
+              <History className="h-3 w-3 mr-1" />
+              Histórico
+            </Button>
+          </div>
+
           <Button
             variant="ghost"
             size="sm"
             onClick={onDisconnect}
-            className="w-full mt-3 text-xs font-mono text-muted-foreground hover:text-destructive"
+            className="w-full mt-2 text-xs font-mono text-muted-foreground hover:text-destructive"
           >
             <Unplug className="h-3 w-3 mr-1" /> Desconectar
           </Button>
         </div>
 
+        {/* Commits / History */}
         <div className="flex-1 overflow-y-auto p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <GitCommit className="h-4 w-4 text-primary" />
-            <span className="font-mono text-sm font-bold text-foreground">Commits recentes</span>
-          </div>
-          {commits.length === 0 ? (
-            <p className="text-xs text-muted-foreground font-mono">Nenhum commit ainda.</p>
-          ) : (
-            <div className="space-y-3">
-              {commits.map((c) => (
-                <div key={c.id} className="border border-border rounded p-2">
-                  <p className="text-xs font-mono text-foreground truncate">{c.commit_message}</p>
-                  <p className="text-[10px] text-muted-foreground font-mono mt-1">
-                    {c.commit_sha?.slice(0, 7)} • {new Date(c.created_at).toLocaleDateString("pt-BR")}
-                  </p>
+          {showHistory ? (
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Clock className="h-4 w-4 text-primary" />
+                  <span className="font-mono text-sm font-bold text-foreground">Histórico completo</span>
                 </div>
-              ))}
-            </div>
+                <button onClick={() => setShowHistory(false)} className="text-muted-foreground hover:text-foreground">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {/* All commits */}
+              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-2">Commits ({commits.length})</p>
+              {commits.length === 0 ? (
+                <p className="text-xs text-muted-foreground font-mono mb-4">Nenhum commit.</p>
+              ) : (
+                <div className="space-y-2 mb-4">
+                  {commits.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`border rounded p-2 ${
+                        c.can_undo ? "border-border" : "border-border/50 opacity-60"
+                      }`}
+                    >
+                      <p className="text-xs font-mono text-foreground truncate">{c.commit_message}</p>
+                      <div className="flex items-center justify-between mt-1">
+                        <p className="text-[10px] text-muted-foreground font-mono">
+                          {c.commit_sha?.slice(0, 7)}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground font-mono">
+                          {new Date(c.created_at).toLocaleString("pt-BR", {
+                            day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+                          })}
+                        </p>
+                      </div>
+                      {!c.can_undo && (
+                        <span className="text-[10px] font-mono text-destructive/70">revertido</span>
+                      )}
+                      {c.files_changed?.length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {c.files_changed.map((f: string, j: number) => (
+                            <span key={j} className="text-[10px] text-primary/70 font-mono bg-primary/5 px-1 rounded">
+                              {f.split("/").pop()}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Chat history summary */}
+              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-2">
+                Mensagens ({messages.length})
+              </p>
+              <div className="space-y-2">
+                {messages.map((m, i) => (
+                  <div key={i} className="border border-border/50 rounded p-2">
+                    <div className="flex items-center gap-1 mb-1">
+                      {m.role === "user" ? (
+                        <User className="h-3 w-3 text-muted-foreground" />
+                      ) : (
+                        <Bot className="h-3 w-3 text-primary" />
+                      )}
+                      <span className="text-[10px] font-mono text-muted-foreground">
+                        {m.role === "user" ? "Você" : "Agente"}
+                      </span>
+                      {m.created_at && (
+                        <span className="text-[10px] font-mono text-muted-foreground/50 ml-auto">
+                          {new Date(m.created_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] font-mono text-foreground/80 line-clamp-2">
+                      {m.content.slice(0, 120)}{m.content.length > 120 ? "..." : ""}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 mb-3">
+                <GitCommit className="h-4 w-4 text-primary" />
+                <span className="font-mono text-sm font-bold text-foreground">Commits recentes</span>
+              </div>
+              {commits.length === 0 ? (
+                <p className="text-xs text-muted-foreground font-mono">Nenhum commit ainda.</p>
+              ) : (
+                <div className="space-y-3">
+                  {commits.slice(0, 10).map((c) => (
+                    <div key={c.id} className="border border-border rounded p-2">
+                      <p className="text-xs font-mono text-foreground truncate">{c.commit_message}</p>
+                      <p className="text-[10px] text-muted-foreground font-mono mt-1">
+                        {c.commit_sha?.slice(0, 7)} • {new Date(c.created_at).toLocaleDateString("pt-BR")}
+                      </p>
+                      {!c.can_undo && (
+                        <span className="text-[10px] font-mono text-destructive/70">revertido</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
